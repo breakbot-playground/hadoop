@@ -25,8 +25,6 @@ import org.apache.hadoop.thirdparty.com.google.common.base.Joiner;
 import org.apache.hadoop.util.Preconditions;
 
 import java.util.Set;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
@@ -80,6 +78,8 @@ import org.apache.hadoop.ipc.RefreshCallQueueProtocol;
 import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.ipc.StandbyException;
+import org.apache.hadoop.metrics2.annotation.Metric;
+import org.apache.hadoop.metrics2.annotation.Metrics;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.net.NetUtils;
@@ -135,6 +135,8 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_I
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_IMAGE_PARALLEL_LOAD_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_BLOCKPLACEMENTPOLICY_MIN_BLOCKS_FOR_WRITE_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_BLOCKPLACEMENTPOLICY_MIN_BLOCKS_FOR_WRITE_KEY;
 import static org.apache.hadoop.hdfs.client.HdfsClientConfigKeys.DFS_NAMENODE_RPC_PORT_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_DEFAULT;
@@ -163,6 +165,8 @@ import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIFELINE_RPC_BIN
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_DEFAULT;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_METRICS_LOGGER_PERIOD_SECONDS_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_OBSERVER_ENABLED_DEFAULT;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_OBSERVER_ENABLED_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_PLUGINS_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_RPC_BIND_HOST_KEY;
@@ -254,6 +258,7 @@ import static org.apache.hadoop.fs.CommonConfigurationKeys.IPC_BACKOFF_ENABLE_DE
  * NameNode state, for example partial blocksMap etc.
  **********************************************************/
 @InterfaceAudience.Private
+@Metrics(context="dfs")
 public class NameNode extends ReconfigurableBase implements
     NameNodeStatusMXBean, TokenVerifier<DelegationTokenIdentifier> {
   static{
@@ -359,7 +364,8 @@ public class NameNode extends ReconfigurableBase implements
           DFS_DATANODE_MAX_NODES_TO_REPORT_KEY,
           DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY,
           DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_LIMIT,
-          DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK));
+          DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK,
+          DFS_NAMENODE_BLOCKPLACEMENTPOLICY_MIN_BLOCKS_FOR_WRITE_KEY));
 
   private static final String USAGE = "Usage: hdfs namenode ["
       + StartupOption.BACKUP.getName() + "] | \n\t["
@@ -427,8 +433,7 @@ public class NameNode extends ReconfigurableBase implements
 
   private static final String NAMENODE_HTRACE_PREFIX = "namenode.htrace.";
 
-  public static final Log MetricsLog =
-      LogFactory.getLog("NameNodeMetricsLog");
+  public static final String METRICS_LOG_NAME = "NameNodeMetricsLog";
 
   protected FSNamesystem namesystem; 
   protected final NamenodeRole role;
@@ -949,13 +954,11 @@ public class NameNode extends ReconfigurableBase implements
       return;
     }
 
-    MetricsLoggerTask.makeMetricsLoggerAsync(MetricsLog);
-
     // Schedule the periodic logging.
     metricsLoggerTimer = new ScheduledThreadPoolExecutor(1);
     metricsLoggerTimer.setExecuteExistingDelayedTasksAfterShutdownPolicy(
         false);
-    metricsLoggerTimer.scheduleWithFixedDelay(new MetricsLoggerTask(MetricsLog,
+    metricsLoggerTimer.scheduleWithFixedDelay(new MetricsLoggerTask(METRICS_LOG_NAME,
         "NameNode", (short) 128),
         metricsLoggerPeriodSec,
         metricsLoggerPeriodSec,
@@ -1127,7 +1130,7 @@ public class NameNode extends ReconfigurableBase implements
           + " this namenode/service.", clientNamenodeAddress);
     }
     this.haEnabled = HAUtil.isHAEnabled(conf, nsId);
-    state = createHAState(getStartupOption(conf));
+    state = createHAState(conf);
     this.allowStaleStandbyReads = HAUtil.shouldAllowStandbyReads(conf);
     this.haContext = createHAContext();
     try {
@@ -1151,6 +1154,7 @@ public class NameNode extends ReconfigurableBase implements
         DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE,
         DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE_DEFAULT);
     this.started.set(true);
+    DefaultMetricsSystem.instance().register(this);
   }
 
   private void stopAtException(Exception e){
@@ -1162,11 +1166,17 @@ public class NameNode extends ReconfigurableBase implements
     }
   }
 
-  protected HAState createHAState(StartupOption startOpt) {
+  protected HAState createHAState(Configuration conf) {
+    StartupOption startOpt = getStartupOption(conf);
     if (!haEnabled || startOpt == StartupOption.UPGRADE
         || startOpt == StartupOption.UPGRADEONLY) {
       return ACTIVE_STATE;
-    } else if (startOpt == StartupOption.OBSERVER) {
+    } else if (conf.getBoolean(DFS_NAMENODE_OBSERVER_ENABLED_KEY,
+          DFS_NAMENODE_OBSERVER_ENABLED_DEFAULT)
+        || startOpt == StartupOption.OBSERVER) {
+      // Set Observer state using config instead of startup option
+      // This allows other startup options to be used when starting observer.
+      // e.g. rollingUpgrade
       return OBSERVER_STATE;
     } else {
       return STANDBY_STATE;
@@ -1221,6 +1231,7 @@ public class NameNode extends ReconfigurableBase implements
         levelDBAliasMapServer.close();
       }
     }
+    started.set(false);
     tracer.close();
   }
 
@@ -2057,6 +2068,26 @@ public class NameNode extends ReconfigurableBase implements
   }
 
   /**
+   * Emit Namenode HA service state as an integer so that one can monitor NN HA
+   * state based on this metric.
+   *
+   * @return  0 when not fully started
+   *          1 for active or standalone (non-HA) NN
+   *          2 for standby
+   *          3 for observer
+   *
+   * These are the same integer values for the HAServiceState enum.
+   */
+  @Metric({"NameNodeState", "Namenode HA service state"})
+  public int getNameNodeState() {
+    if (!isStarted() || state == null) {
+      return HAServiceState.INITIALIZING.ordinal();
+    }
+
+    return state.getServiceState().ordinal();
+  }
+
+  /**
    * Register NameNodeStatusMXBean
    */
   private void registerNNSMXBean() {
@@ -2334,6 +2365,8 @@ public class NameNode extends ReconfigurableBase implements
         (property.equals(DFS_NAMENODE_DECOMMISSION_BACKOFF_MONITOR_PENDING_BLOCKS_PER_LOCK))) {
       return reconfigureDecommissionBackoffMonitorParameters(datanodeManager, property,
           newVal);
+    } else if (property.equals(DFS_NAMENODE_BLOCKPLACEMENTPOLICY_MIN_BLOCKS_FOR_WRITE_KEY)) {
+      return reconfigureMinBlocksForWrite(property, newVal);
     } else {
       throw new ReconfigurationException(property, newVal, getConf().get(
           property));
@@ -2640,6 +2673,18 @@ public class NameNode extends ReconfigurableBase implements
       return newSetting;
     } catch (IllegalArgumentException e) {
       throw new ReconfigurationException(property, newVal, getConf().get(property), e);
+    }
+  }
+
+  private String reconfigureMinBlocksForWrite(String property, String newValue)
+      throws ReconfigurationException {
+    try {
+      int newSetting = adjustNewVal(
+          DFS_NAMENODE_BLOCKPLACEMENTPOLICY_MIN_BLOCKS_FOR_WRITE_DEFAULT, newValue);
+      namesystem.getBlockManager().setMinBlocksForWrite(newSetting);
+      return String.valueOf(newSetting);
+    } catch (IllegalArgumentException e) {
+      throw new ReconfigurationException(property, newValue, getConf().get(property), e);
     }
   }
 

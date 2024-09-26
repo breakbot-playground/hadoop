@@ -193,13 +193,53 @@ public class MembershipNamenodeResolver
     }
   }
 
+  /**
+   * Try to shuffle the multiple observer namenodes if listObserversFirst is true.
+   * @param inputNameNodes the input FederationNamenodeContext list. If listObserversFirst is true,
+   *                       all observers will be placed at the front of the collection.
+   * @param listObserversFirst true if we need to shuffle the multiple front observer namenodes.
+   * @return a list of FederationNamenodeContext.
+   * @param <T> a subclass of FederationNamenodeContext.
+   */
+  private <T extends FederationNamenodeContext> List<T> shuffleObserverNN(
+      List<T> inputNameNodes, boolean listObserversFirst) {
+    if (!listObserversFirst) {
+      return inputNameNodes;
+    }
+    // Get Observers first.
+    List<T> observerList = new ArrayList<>();
+    for (T t : inputNameNodes) {
+      if (t.getState() == OBSERVER) {
+        observerList.add(t);
+      } else {
+        // The inputNameNodes are already sorted, so it can break
+        // when the first non-observer is encountered.
+        break;
+      }
+    }
+    // Returns the inputNameNodes if no shuffle is required
+    if (observerList.size() <= 1) {
+      return inputNameNodes;
+    }
+
+    // Shuffle multiple Observers
+    Collections.shuffle(observerList);
+
+    List<T> ret = new ArrayList<>(inputNameNodes.size());
+    ret.addAll(observerList);
+    for (int i = observerList.size(); i < inputNameNodes.size(); i++) {
+      ret.add(inputNameNodes.get(i));
+    }
+    return Collections.unmodifiableList(ret);
+  }
+
   @Override
   public List<? extends FederationNamenodeContext> getNamenodesForNameserviceId(
       final String nsId, boolean listObserversFirst) throws IOException {
 
     List<? extends FederationNamenodeContext> ret = cacheNS.get(Pair.of(nsId, listObserversFirst));
     if (ret != null) {
-      return ret;
+      return shuffleObserverNN(ret, listObserversFirst);
     }
 
     // Not cached, generate the value
@@ -437,5 +477,46 @@ public class MembershipNamenodeResolver
   @Override
   public void setRouterId(String router) {
     this.routerId = router;
+  }
+
+  /**
+   * Rotate cache, make the current namenode have the lowest priority,
+   * to ensure that the current namenode will not be accessed first next time.
+   *
+   * @param nsId name service id
+   * @param namenode namenode contexts
+   * @param listObserversFirst Observer read case, observer NN will be ranked first
+   */
+  @Override
+  public void rotateCache(
+      String nsId, FederationNamenodeContext namenode, boolean listObserversFirst) {
+    cacheNS.compute(Pair.of(nsId, listObserversFirst), (ns, namenodeContexts) -> {
+      if (namenodeContexts == null || namenodeContexts.size() <= 1) {
+        return namenodeContexts;
+      }
+      FederationNamenodeContext firstNamenodeContext = namenodeContexts.get(0);
+      /*
+       * If the first nn in the cache is active, the active nn priority cannot be lowered.
+       * This happens when other threads have already updated the cache.
+       */
+      if (firstNamenodeContext.getState().equals(ACTIVE)) {
+        return namenodeContexts;
+      }
+      /*
+       * If the first nn in the cache at this time is not the nn
+       * that needs to be lowered in priority, there is no need to rotate.
+       * This happens when other threads have already rotated the cache.
+       */
+      if (firstNamenodeContext.getRpcAddress().equals(namenode.getRpcAddress())) {
+        List<FederationNamenodeContext> rotatedNnContexts = new ArrayList<>(namenodeContexts);
+        Collections.rotate(rotatedNnContexts, -1);
+        String firstNamenodeId = namenodeContexts.get(0).getNamenodeId();
+        LOG.info("Rotate cache of pair <ns: {}, observer first: {}>, put namenode: {} in the " +
+            "first position of the cache and namenode: {} in the last position of the cache",
+            nsId, listObserversFirst, firstNamenodeId, namenode.getNamenodeId());
+        return rotatedNnContexts;
+      }
+      return namenodeContexts;
+    });
   }
 }

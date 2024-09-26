@@ -234,7 +234,12 @@ public class MiniRouterDFSCluster {
       return DistributedFileSystem.get(conf);
     }
 
-    public FileSystem getFileSystemWithObserverReadsEnabled() throws IOException {
+    public FileSystem getFileSystem(Configuration configuration) throws  IOException {
+      configuration.addResource(conf);
+      return DistributedFileSystem.get(configuration);
+    }
+
+    public FileSystem getFileSystemWithObserverReadProxyProvider() throws IOException {
       Configuration observerReadConf = new Configuration(conf);
       observerReadConf.set(DFS_NAMESERVICES,
           observerReadConf.get(DFS_NAMESERVICES)+ ",router-service");
@@ -1196,5 +1201,14 @@ public class MiniRouterDFSCluster {
     } catch (Exception e) {
       throw new IOException("Cannot wait for the namenodes", e);
     }
+  }
+
+  /**
+   * Get cache flush interval in milliseconds.
+   *
+   * @return Cache flush interval in milliseconds.
+   */
+  public long getCacheFlushInterval() {
+    return cacheFlushInterval;
   }
 }

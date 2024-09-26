@@ -30,7 +30,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-import com.amazonaws.AmazonClientException;
+import software.amazon.awssdk.core.exception.SdkException;
 import org.apache.hadoop.util.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,10 +38,12 @@ import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.InvalidRequestException;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.s3a.api.UnsupportedRequestException;
 import org.apache.hadoop.fs.s3a.auth.NoAuthWithAWSException;
 import org.apache.hadoop.io.retry.RetryPolicies;
 import org.apache.hadoop.io.retry.RetryPolicy;
 import org.apache.hadoop.net.ConnectTimeoutException;
+
 
 import static org.apache.hadoop.io.retry.RetryPolicies.*;
 
@@ -67,9 +69,9 @@ import static org.apache.hadoop.fs.s3a.Constants.*;
  *
  * The retry policy is all built around that of the normal IO exceptions,
  * particularly those extracted from
- * {@link S3AUtils#translateException(String, Path, AmazonClientException)}.
+ * {@link S3AUtils#translateException(String, Path, SdkException)}.
  * Because the {@link #shouldRetry(Exception, int, int, boolean)} method
- * does this translation if an {@code AmazonClientException} is processed,
+ * does this translation if an {@code SdkException} is processed,
  * the policy defined for the IOEs also applies to the original exceptions.
  *
  * Put differently: this retry policy aims to work for handlers of the
@@ -111,6 +113,11 @@ public class S3ARetryPolicy implements RetryPolicy {
   protected final RetryPolicy connectivityFailure;
 
   /**
+   * Handling of AWSClientIOException and subclasses.
+   */
+  protected final RetryPolicy retryAwsClientExceptions;
+
+  /**
    * Instantiate.
    * @param conf configuration to read.
    */
@@ -136,6 +143,11 @@ public class S3ARetryPolicy implements RetryPolicy {
     // idempotent calls are retried on IOEs but not other exceptions
     retryIdempotentCalls = new FailNonIOEs(
         new IdempotencyRetryFilter(baseExponentialRetry));
+
+    // retry on AWSClientIOException and possibly subclasses;
+    // See: HADOOP-18871. S3ARetryPolicy to use sdk exception retryable() if it is valid
+    // currently the normal retryIdempotentCalls policy is used.
+    retryAwsClientExceptions = retryIdempotentCalls;
 
     // and a separate policy for throttle requests, which are considered
     // repeatable, even for non-idempotent calls, as the service
@@ -222,11 +234,16 @@ public class S3ARetryPolicy implements RetryPolicy {
     // server didn't respond.
     policyMap.put(AWSNoResponseException.class, retryIdempotentCalls);
 
+    // use specific retry policy for aws client exceptions
+    policyMap.put(AWSClientIOException.class, retryAwsClientExceptions);
+    policyMap.put(AWSServiceIOException.class, retryAwsClientExceptions);
+
     // other operations
-    policyMap.put(AWSClientIOException.class, retryIdempotentCalls);
-    policyMap.put(AWSServiceIOException.class, retryIdempotentCalls);
     policyMap.put(AWSS3IOException.class, retryIdempotentCalls);
     policyMap.put(SocketTimeoutException.class, retryIdempotentCalls);
+
+    // Unsupported requests do not work, however many times you try
+    policyMap.put(UnsupportedRequestException.class, fail);
 
     return policyMap;
   }
@@ -238,11 +255,10 @@ public class S3ARetryPolicy implements RetryPolicy {
       boolean idempotent) throws Exception {
     Preconditions.checkArgument(exception != null, "Null exception");
     Exception ex = exception;
-    if (exception instanceof AmazonClientException) {
-      // uprate the amazon client exception for the purpose of exception
+    if (exception instanceof SdkException) {
+      // update the sdk exception for the purpose of exception
       // processing.
-      ex = S3AUtils.translateException("", "",
-          (AmazonClientException) exception);
+      ex = S3AUtils.translateException("", "", (SdkException) exception);
     }
     return retryPolicy.shouldRetry(ex, retries, failovers, idempotent);
   }
@@ -307,6 +323,30 @@ public class S3ARetryPolicy implements RetryPolicy {
       return
           e instanceof IOException ?
               next.shouldRetry(e, retries, failovers, true)
+              : RetryAction.FAIL;
+    }
+  }
+
+  /**
+   * Policy where AWS SDK exceptions are retried if they state that they are retryable.
+   * See HADOOP-18871. S3ARetryPolicy to use sdk exception retryable() if it is valid.
+   */
+  private static final class RetryFromAWSClientExceptionPolicy implements RetryPolicy {
+
+    private final RetryPolicy next;
+
+    private RetryFromAWSClientExceptionPolicy(RetryPolicy next) {
+      this.next = next;
+    }
+
+    @Override
+    public RetryAction shouldRetry(Exception e,
+        int retries,
+        int failovers,
+        boolean isIdempotentOrAtMostOnce) throws Exception {
+      return
+          e instanceof AWSClientIOException ?
+              next.shouldRetry(e, retries, failovers, ((AWSClientIOException)e).retryable())
               : RetryAction.FAIL;
     }
   }

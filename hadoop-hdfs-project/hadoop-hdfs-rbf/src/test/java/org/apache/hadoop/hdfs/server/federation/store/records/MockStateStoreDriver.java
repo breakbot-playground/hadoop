@@ -18,11 +18,13 @@
 package org.apache.hadoop.hdfs.server.federation.store.records;
 
 import org.apache.hadoop.hdfs.server.federation.store.StateStoreUtils;
+import org.apache.hadoop.hdfs.server.federation.store.driver.StateStoreOperationResult;
 import org.apache.hadoop.hdfs.server.federation.store.driver.impl.StateStoreBaseImpl;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -35,7 +37,7 @@ import java.util.Map;
 public class MockStateStoreDriver extends StateStoreBaseImpl {
   private boolean giveErrors = false;
   private boolean initialized = false;
-  private final Map<String, Map<String, BaseRecord>> valueMap = new HashMap<>();
+  private static final Map<String, Map<String, BaseRecord>> VALUE_MAP = new HashMap<>();
 
   @Override
   public boolean initDriver() {
@@ -56,7 +58,7 @@ public class MockStateStoreDriver extends StateStoreBaseImpl {
 
   @Override
   public void close() throws Exception {
-    valueMap.clear();
+    VALUE_MAP.clear();
     initialized = false;
   }
 
@@ -82,21 +84,20 @@ public class MockStateStoreDriver extends StateStoreBaseImpl {
   @SuppressWarnings("unchecked")
   public <T extends BaseRecord> QueryResult<T> get(Class<T> clazz) throws IOException {
     checkErrors();
-    Map<String, BaseRecord> map = valueMap.get(StateStoreUtils.getRecordName(clazz));
+    Map<String, BaseRecord> map = VALUE_MAP.get(StateStoreUtils.getRecordName(clazz));
     List<T> results =
         map != null ? new ArrayList<>((Collection<T>) map.values()) : new ArrayList<>();
     return new QueryResult<>(results, System.currentTimeMillis());
   }
 
   @Override
-  public <T extends BaseRecord> boolean putAll(List<T> records,
-                                               boolean allowUpdate,
-                                               boolean errorIfExists)
-      throws IOException {
+  public <T extends BaseRecord> StateStoreOperationResult putAll(List<T> records,
+      boolean allowUpdate,
+      boolean errorIfExists) throws IOException {
     checkErrors();
     for (T record : records) {
       Map<String, BaseRecord> map =
-          valueMap.computeIfAbsent(StateStoreUtils.getRecordName(record.getClass()),
+          VALUE_MAP.computeIfAbsent(StateStoreUtils.getRecordName(record.getClass()),
               k -> new HashMap<>());
       String key = record.getPrimaryKey();
       BaseRecord oldRecord = map.get(key);
@@ -107,13 +108,20 @@ public class MockStateStoreDriver extends StateStoreBaseImpl {
             + ": " + key);
       }
     }
-    return true;
+    return new StateStoreOperationResult(Collections.emptyList(), true);
+  }
+
+  /**
+   * Clear all records from the store.
+   */
+  public void clearAll() {
+    VALUE_MAP.clear();
   }
 
   @Override
   public <T extends BaseRecord> boolean removeAll(Class<T> clazz) throws IOException {
     checkErrors();
-    return valueMap.remove(StateStoreUtils.getRecordName(clazz)) != null;
+    return VALUE_MAP.remove(StateStoreUtils.getRecordName(clazz)) != null;
   }
 
   @Override
@@ -124,7 +132,7 @@ public class MockStateStoreDriver extends StateStoreBaseImpl {
     checkErrors();
     int result = 0;
     Map<String, BaseRecord> map =
-        valueMap.get(StateStoreUtils.getRecordName(clazz));
+        VALUE_MAP.get(StateStoreUtils.getRecordName(clazz));
     if (map != null) {
       for (Iterator<BaseRecord> itr = map.values().iterator(); itr.hasNext();) {
         BaseRecord record = itr.next();
